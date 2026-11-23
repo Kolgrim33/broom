@@ -1,0 +1,20 @@
+[package]
+name = "broom"
+version = "0.1.0"
+edition = "2024"
+description = "Blazing-fast, zero-dependency CLI to find and sweep stale build artifacts and dev caches"
+license = "MIT"
+keywords = ["cli", "clean", "disk", "artifacts", "developer-tools"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
+readme = "README.md"
+
+[[bin]]
+name = "broom"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
