@@ -57,6 +57,7 @@ pub enum ParseOutcome {
     Run(Config),
     PrintHelp,
     PrintVersion,
+    PrintCompletions(String),
 }
 
 pub fn parse_args<I>(args: I) -> Result<ParseOutcome, String>
@@ -82,6 +83,10 @@ where
             match flag {
                 "--help" => return Ok(ParseOutcome::PrintHelp),
                 "--version" => return Ok(ParseOutcome::PrintVersion),
+                "--completions" => {
+                    let val = take_value(flag, inline_val, &mut iter)?;
+                    return Ok(ParseOutcome::PrintCompletions(completion_script(&val)?));
+                }
                 "--dry-run" => cfg.dry_run = true,
                 "--yes" => cfg.yes = true,
                 "--interactive" => cfg.interactive = true,
@@ -344,6 +349,7 @@ OPTIONS:
         --json                Output results as JSON (implies --dry-run)
         --no-color            Disable colored output
     -j, --threads <N>         Number of worker threads (default: CPU count)
+        --completions <SHELL> Generate shell completion script (bash, zsh, fish)
     -h, --help                Print help
     -V, --version             Print version
 
@@ -360,6 +366,225 @@ EXAMPLES:
         version = env!("CARGO_PKG_VERSION"),
         ecosystems = ecosystems.join(", "),
     )
+}
+
+/// Shells supported by the `--completions` flag.
+const COMPLETION_SHELLS: &[&str] = &["bash", "zsh", "fish"];
+const SORT_VALUES: &[&str] = &["size", "age", "path"];
+
+/// Long options and their descriptions, kept in sync with `parse_args`.
+const LONG_OPTIONS: &[(&str, &str)] = &[
+    ("--dry-run", "Scan and print report only, do not delete"),
+    ("--yes", "Delete all matched artifacts without prompting"),
+    ("--interactive", "Prompt individually for each artifact"),
+    ("--json", "Output results as JSON"),
+    ("--no-color", "Disable colored output"),
+    ("--hidden", "Descend into hidden directories"),
+    ("--reverse", "Reverse sort order"),
+    ("--min-size", "Only match artifacts at least SIZE"),
+    (
+        "--older-than",
+        "Only match projects untouched for at least AGE",
+    ),
+    ("--max-depth", "Maximum directory depth to scan"),
+    ("--type", "Filter by ecosystem, comma separated"),
+    ("--exclude", "Exclude paths containing PATTERN"),
+    ("--sort", "Sort by size, age, or path"),
+    ("--limit", "Show or operate on at most N results"),
+    ("--threads", "Number of worker threads"),
+    ("--completions", "Generate shell completion script"),
+    ("--help", "Print help"),
+    ("--version", "Print version"),
+];
+
+const SHORT_OPTIONS: &[(&str, &str)] = &[
+    ("-n", "Scan and print report only"),
+    ("-y", "Delete all matched artifacts without prompting"),
+    ("-i", "Prompt individually for each artifact"),
+    ("-r", "Reverse sort order"),
+    ("-s", "Only match artifacts at least SIZE"),
+    ("-a", "Only match projects untouched for at least AGE"),
+    ("-d", "Maximum directory depth to scan"),
+    ("-t", "Filter by ecosystem, comma separated"),
+    ("-e", "Exclude paths containing PATTERN"),
+    ("-j", "Number of worker threads"),
+    ("-h", "Print help"),
+    ("-V", "Print version"),
+];
+
+const SHORT_TO_LONG: &[(&str, &str)] = &[
+    ("-n", "--dry-run"),
+    ("-y", "--yes"),
+    ("-i", "--interactive"),
+    ("-r", "--reverse"),
+    ("-s", "--min-size"),
+    ("-a", "--older-than"),
+    ("-d", "--max-depth"),
+    ("-t", "--type"),
+    ("-e", "--exclude"),
+    ("-j", "--threads"),
+    ("-h", "--help"),
+    ("-V", "--version"),
+];
+
+fn all_flags() -> String {
+    let mut flags: Vec<&str> = LONG_OPTIONS.iter().map(|(f, _)| *f).collect();
+    flags.extend(SHORT_OPTIONS.iter().map(|(f, _)| *f));
+    flags.join(" ")
+}
+
+fn ecosystem_ids() -> String {
+    Ecosystem::ALL
+        .iter()
+        .map(|e| e.id())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Returns a completion script for `shell`, or an error listing supported shells.
+pub fn completion_script(shell: &str) -> Result<String, String> {
+    let ecosystems = ecosystem_ids();
+    match shell.trim().to_ascii_lowercase().as_str() {
+        "bash" => Ok(bash_completion(&ecosystems)),
+        "zsh" => Ok(zsh_completion(&ecosystems)),
+        "fish" => Ok(fish_completion(&ecosystems)),
+        _ => Err(format!(
+            "unknown shell '{shell}'. Supported shells: {}",
+            COMPLETION_SHELLS.join(", ")
+        )),
+    }
+}
+
+fn bash_completion(ecosystems: &str) -> String {
+    let template = r#"
+_broom() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts="__OPTS__"
+
+    case "$prev" in
+        --sort)
+            COMPREPLY=( $(compgen -W "size age path" -- "$cur") )
+            return 0
+            ;;
+        --type|-t)
+            COMPREPLY=( $(compgen -W "__ECOSYSTEMS__" -- "$cur") )
+            return 0
+            ;;
+        --completions)
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -f -- "$cur") )
+    fi
+    return 0
+}
+
+complete -F _broom broom
+"#;
+    template
+        .replace("__OPTS__", &all_flags())
+        .replace("__ECOSYSTEMS__", ecosystems)
+}
+
+fn zsh_completion(ecosystems: &str) -> String {
+    let mut lines = vec![
+        "#compdef broom".to_string(),
+        "_broom() {".to_string(),
+        "    local -a args".to_string(),
+        "    args=(".to_string(),
+    ];
+
+    for (flag, desc) in LONG_OPTIONS {
+        let (flag, desc) = (*flag, *desc);
+        let spec = match flag {
+            "--sort" => format!(
+                "        '--sort[Sort by]:field:({})'",
+                SORT_VALUES.join(" ")
+            ),
+            "--type" => format!("        '--type[Filter by ecosystem]:list:({ecosystems})'"),
+            "--completions" => {
+                "        '--completions[Generate shell completion]:shell:(bash zsh fish)'"
+                    .to_string()
+            }
+            "--min-size" => "        '--min-size[Minimum artifact size]:size:'".to_string(),
+            "--older-than" => "        '--older-than[Minimum idle age]:age:'".to_string(),
+            "--max-depth" => "        '--max-depth[Maximum scan depth]:n:'".to_string(),
+            "--exclude" => "        '--exclude[Exclude pattern]:pattern:'".to_string(),
+            "--limit" => "        '--limit[Result limit]:n:'".to_string(),
+            "--threads" => "        '--threads[Worker threads]:n:'".to_string(),
+            _ => format!("        '{flag}[{desc}]'"),
+        };
+        lines.push(spec);
+    }
+
+    for (flag, desc) in SHORT_OPTIONS {
+        let (flag, desc) = (*flag, *desc);
+        let spec = match flag {
+            "-t" => format!("        '-t[Filter by ecosystem]:list:({ecosystems})'"),
+            "-s" => "        '-s[Minimum artifact size]:size:'".to_string(),
+            "-a" => "        '-a[Minimum idle age]:age:'".to_string(),
+            "-d" => "        '-d[Maximum scan depth]:n:'".to_string(),
+            "-e" => "        '-e[Exclude pattern]:pattern:'".to_string(),
+            "-j" => "        '-j[Worker threads]:n:'".to_string(),
+            _ => format!("        '{flag}[{desc}]'"),
+        };
+        lines.push(spec);
+    }
+
+    lines.extend([
+        "    )".to_string(),
+        "    _arguments -s -S ${args[@]} '*:path:_files'".to_string(),
+        "}".to_string(),
+        "(( $+functions[compdef] )) && compdef _broom broom".to_string(),
+    ]);
+    lines.join("\n") + "\n"
+}
+
+fn fish_completion(ecosystems: &str) -> String {
+    let mut lines = vec!["# Fish completion for broom".to_string()];
+
+    for (flag, desc) in LONG_OPTIONS {
+        let (flag, desc) = (*flag, *desc);
+        let mut parts = vec!["complete -c broom".to_string()];
+        if let Some((short, _)) = SHORT_TO_LONG.iter().find(|(_, long)| *long == flag) {
+            parts.push(format!("-s {}", &short[1..]));
+        }
+        parts.push(format!("-l {}", &flag[2..]));
+        let (requires, choices) = match flag {
+            "--sort" => (true, Some(SORT_VALUES.join(" "))),
+            "--type" => (true, Some(ecosystems.to_string())),
+            "--completions" => (true, Some(COMPLETION_SHELLS.join(" "))),
+            "--min-size" | "--older-than" | "--max-depth" | "--exclude" | "--limit"
+            | "--threads" => (true, None),
+            _ => (false, None),
+        };
+        if requires {
+            parts.push("-r".to_string());
+        }
+        if let Some(choices) = choices {
+            parts.push(format!("-a '{choices}'"));
+        }
+        parts.push(format!("-d '{desc}'"));
+        lines.push(parts.join(" "));
+    }
+
+    for (flag, desc) in SHORT_OPTIONS {
+        let (flag, desc) = (*flag, *desc);
+        if SHORT_TO_LONG.iter().any(|(short, _)| *short == flag) {
+            continue;
+        }
+        lines.push(format!("complete -c broom -s {} -d '{desc}'", &flag[1..]));
+    }
+
+    lines.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -427,5 +652,56 @@ mod tests {
         assert_eq!(cfg.ecosystems, vec![Ecosystem::Rust, Ecosystem::Node]);
         assert_eq!(cfg.sort_by, SortBy::Age);
         assert_eq!(cfg.paths, vec![PathBuf::from("/tmp/code")]);
+    }
+
+    #[test]
+    fn generates_completions_for_all_supported_shells() {
+        for shell in COMPLETION_SHELLS {
+            let script = completion_script(shell).unwrap();
+            assert!(
+                !script.trim().is_empty(),
+                "{shell} completion should not be empty"
+            );
+            for (flag, _) in LONG_OPTIONS {
+                let name = flag.trim_start_matches('-');
+                assert!(
+                    script.contains(name),
+                    "{shell} completion is missing {flag}"
+                );
+            }
+            for value in SORT_VALUES {
+                assert!(
+                    script.contains(value),
+                    "{shell} completion is missing sort value {value}"
+                );
+            }
+            for eco in ["rust", "node", "python", "terraform"] {
+                assert!(
+                    script.contains(eco),
+                    "{shell} completion is missing ecosystem {eco}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_completion_shell() {
+        let err = completion_script("powershell").unwrap_err();
+        assert!(err.contains("powershell"));
+        for shell in COMPLETION_SHELLS {
+            assert!(err.contains(shell));
+        }
+        assert!(completion_script("BASH").is_ok());
+    }
+
+    #[test]
+    fn parses_completions_flag() {
+        let outcome = parse_args(["broom", "--completions", "zsh"].map(String::from)).unwrap();
+        let ParseOutcome::PrintCompletions(script) = outcome else {
+            panic!("expected PrintCompletions");
+        };
+        assert!(script.contains("compdef"));
+        assert!(parse_args(["broom", "--completions=fish"].map(String::from)).is_ok());
+        assert!(parse_args(["broom", "--completions", "tcsh"].map(String::from)).is_err());
     }
 }

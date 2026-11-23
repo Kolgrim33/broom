@@ -33,6 +33,10 @@ fn main() -> ExitCode {
             println!("broom {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        ParseOutcome::PrintCompletions(script) => {
+            print!("{script}");
+            return ExitCode::SUCCESS;
+        }
         ParseOutcome::Run(cfg) => cfg,
     };
 
