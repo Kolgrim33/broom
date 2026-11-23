@@ -101,7 +101,9 @@ fn detects_supported_ecosystems_and_avoids_false_positives() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\\\\", "/");
 
     assert!(
         stdout.contains("rust-app/target"),
@@ -143,27 +145,29 @@ fn detects_supported_ecosystems_and_avoids_false_positives() {
 #[test]
 fn filters_by_ecosystem_and_exclude() {
     let ws = TempWorkspace::new("filters");
-    ws.write_file("a/Cargo.toml", b"[package]\n");
-    ws.write_file("a/target/bin", &vec![0u8; 4096]);
-    ws.write_file("b/Cargo.toml", b"[package]\n");
-    ws.write_file("b/target/bin", &vec![0u8; 4096]);
-    ws.write_file("c/package.json", b"{}\n");
-    ws.write_file("c/node_modules/x.js", &vec![0u8; 4096]);
+    ws.write_file("keep-me/Cargo.toml", b"[package]\n");
+    ws.write_file("keep-me/target/bin", &vec![0u8; 4096]);
+    ws.write_file("skip-me/Cargo.toml", b"[package]\n");
+    ws.write_file("skip-me/target/bin", &vec![0u8; 4096]);
+    ws.write_file("web/package.json", b"{}\n");
+    ws.write_file("web/node_modules/x.js", &vec![0u8; 4096]);
 
     let output = broom_bin()
-        .args(["--json", "-t", "rust", "-e", "/b/"])
+        .args(["--json", "-t", "rust", "-e", "skip-me"])
         .arg(ws.path())
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\\\\", "/");
     assert!(
         stdout.contains("\"count\": 1"),
         "unexpected output:\n{stdout}"
     );
-    assert!(stdout.contains("a/target"));
-    assert!(!stdout.contains("b/target"));
+    assert!(stdout.contains("keep-me/target"));
+    assert!(!stdout.contains("skip-me/target"));
     assert!(!stdout.contains("node_modules"));
 }
 

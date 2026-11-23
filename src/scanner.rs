@@ -133,10 +133,7 @@ pub fn scan(cfg: &Config) -> ScanReport {
         {
             return false;
         }
-        if !cfg.ecosystems.is_empty() && !cfg.ecosystems.contains(&a.ecosystem) {
-            return false;
-        }
-        true
+        cfg.ecosystems.is_empty() || cfg.ecosystems.contains(&a.ecosystem)
     });
 
     // Sort results
