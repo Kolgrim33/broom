@@ -2,6 +2,7 @@ mod cleaner;
 mod cli;
 mod ecosystems;
 mod format;
+mod progress;
 mod scanner;
 
 use std::io::{self, IsTerminal, Write};
@@ -16,6 +17,7 @@ use crate::format::{
     format_age, format_bytes, format_duration_short, print_files_table, print_table,
     render_files_json, render_json, should_use_color,
 };
+use crate::progress::{ProgressBar, ScanMode, should_show_progress, should_use_stderr_color};
 use crate::scanner::{Artifact, LargeFile};
 
 trait SweepItem {
@@ -103,7 +105,13 @@ fn main() -> ExitCode {
 }
 
 fn run_artifacts_mode(cfg: &Config) -> ExitCode {
-    let report = scanner::scan(cfg);
+    let show_progress = should_show_progress(cfg.json);
+    let stderr_color = should_use_stderr_color(cfg.no_color);
+
+    let (scan_bar, scan_progress) =
+        ProgressBar::start_scan(ScanMode::Artifacts, show_progress, stderr_color);
+    let report = scanner::scan(cfg, scan_progress.as_deref());
+    scan_bar.finish();
 
     if cfg.json {
         print!("{}", render_json(&report));
@@ -141,12 +149,22 @@ fn run_artifacts_mode(cfg: &Config) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let summary = clean_artifacts(&targets);
+    let total_bytes: u64 = targets.iter().map(|a| a.size_bytes).sum();
+    let (clean_bar, clean_progress) =
+        ProgressBar::start_clean(targets.len(), total_bytes, show_progress, stderr_color);
+    let summary = clean_artifacts(&targets, clean_progress.as_deref());
+    clean_bar.finish();
     finish_clean_summary(&summary, "artifact", "artifacts", color)
 }
 
 fn run_files_mode(cfg: &Config) -> ExitCode {
-    let report = scanner::scan_files(cfg);
+    let show_progress = should_show_progress(cfg.json);
+    let stderr_color = should_use_stderr_color(cfg.no_color);
+
+    let (scan_bar, scan_progress) =
+        ProgressBar::start_scan(ScanMode::Files, show_progress, stderr_color);
+    let report = scanner::scan_files(cfg, scan_progress.as_deref());
+    scan_bar.finish();
 
     if cfg.json {
         print!("{}", render_files_json(&report));
@@ -184,7 +202,11 @@ fn run_files_mode(cfg: &Config) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let summary = clean_files(&targets);
+    let total_bytes: u64 = targets.iter().map(|f| f.size_bytes).sum();
+    let (clean_bar, clean_progress) =
+        ProgressBar::start_clean(targets.len(), total_bytes, show_progress, stderr_color);
+    let summary = clean_files(&targets, clean_progress.as_deref());
+    clean_bar.finish();
     finish_clean_summary(&summary, "file", "files", color)
 }
 

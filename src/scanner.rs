@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::{Config, SortBy};
 use crate::ecosystems::{self, Ecosystem};
+use crate::progress::ScanProgress;
 
 pub const DEFAULT_FILES_LIMIT: usize = 25;
 
@@ -55,7 +56,7 @@ struct WorkQueue {
     active_workers: usize,
 }
 
-pub fn scan(cfg: &Config) -> ScanReport {
+pub fn scan(cfg: &Config, progress: Option<&ScanProgress>) -> ScanReport {
     let start = Instant::now();
     let now = SystemTime::now();
 
@@ -112,7 +113,11 @@ pub fn scan(cfg: &Config) -> ScanReport {
                     };
 
                     dirs_scanned.fetch_add(1, Ordering::Relaxed);
-                    let (found, next_dirs) = process_directory(&work.dir, work.depth, cfg, now);
+                    if let Some(p) = progress {
+                        p.add_dir();
+                    }
+                    let (found, next_dirs) =
+                        process_directory(&work.dir, work.depth, cfg, now, progress);
 
                     if !found.is_empty() {
                         results.lock().unwrap().extend(found);
@@ -188,6 +193,7 @@ fn process_directory(
     depth: usize,
     cfg: &Config,
     now: SystemTime,
+    progress: Option<&ScanProgress>,
 ) -> (Vec<Artifact>, Vec<PathBuf>) {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return (Vec::new(), Vec::new());
@@ -247,13 +253,25 @@ fn process_directory(
                 continue;
             }
 
-            let (size_bytes, file_count, artifact_mtime) = measure_dir(path);
+            let stream_bytes = cfg.min_size == 0 && cfg.older_than.is_none();
+            let (size_bytes, file_count, artifact_mtime) =
+                measure_dir_inner(path, if stream_bytes { progress } else { None });
             let effective_mtime = newest_project_mtime
                 .or(artifact_mtime)
                 .or_else(|| fs::metadata(dir).and_then(|m| m.modified()).ok());
             let project_age = effective_mtime
                 .and_then(|m| now.duration_since(m).ok())
                 .unwrap_or(Duration::ZERO);
+
+            if let Some(p) = progress {
+                if stream_bytes {
+                    p.add_found(0);
+                } else if size_bytes >= cfg.min_size
+                    && cfg.older_than.is_none_or(|min_age| project_age >= min_age)
+                {
+                    p.add_found(size_bytes);
+                }
+            }
 
             found.push(Artifact {
                 path: path.clone(),
@@ -339,7 +357,10 @@ fn file_disk_bytes(meta: &fs::Metadata) -> u64 {
 
 /// Computes actual disk usage (with hardlink deduplication on Unix) and file count
 /// without following symlinks.
-pub fn measure_dir(root: &Path) -> (u64, u64, Option<SystemTime>) {
+fn measure_dir_inner(
+    root: &Path,
+    progress: Option<&ScanProgress>,
+) -> (u64, u64, Option<SystemTime>) {
     let mut stack = vec![root.to_path_buf()];
     let mut total_bytes: u64 = 0;
     let mut total_files: u64 = 0;
@@ -351,6 +372,7 @@ pub fn measure_dir(root: &Path) -> (u64, u64, Option<SystemTime>) {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
+        let mut dir_bytes: u64 = 0;
         for entry in entries.flatten() {
             let Ok(meta) = fs::symlink_metadata(entry.path()) else {
                 continue;
@@ -374,8 +396,12 @@ pub fn measure_dir(root: &Path) -> (u64, u64, Option<SystemTime>) {
                         continue;
                     }
                 }
-                total_bytes = total_bytes.saturating_add(file_disk_bytes(&meta));
+                dir_bytes = dir_bytes.saturating_add(file_disk_bytes(&meta));
             }
+        }
+        total_bytes = total_bytes.saturating_add(dir_bytes);
+        if let Some(p) = progress {
+            p.add_bytes(dir_bytes);
         }
     }
 
@@ -416,7 +442,7 @@ fn file_extension(path: &Path) -> String {
 }
 
 /// Parallel walker that finds the largest individual files under `cfg.paths`.
-pub fn scan_files(cfg: &Config) -> FileScanReport {
+pub fn scan_files(cfg: &Config, progress: Option<&ScanProgress>) -> FileScanReport {
     let start = Instant::now();
     let now = SystemTime::now();
     let effective_limit = cfg.limit.unwrap_or(DEFAULT_FILES_LIMIT);
@@ -517,8 +543,12 @@ pub fn scan_files(cfg: &Config) -> FileScanReport {
                     };
 
                     dirs_scanned.fetch_add(1, Ordering::Relaxed);
+                    if let Some(p) = progress {
+                        p.add_dir();
+                    }
                     let mut next_dirs = Vec::new();
                     let can_descend = cfg.max_depth.is_none_or(|max| work.depth < max);
+                    let mut dir_files_scanned: usize = 0;
 
                     if let Ok(read_dir) = fs::read_dir(&work.dir) {
                         for entry in read_dir.flatten() {
@@ -552,7 +582,7 @@ pub fn scan_files(cfg: &Config) -> FileScanReport {
                                 if !cfg.include_hidden && name.starts_with('.') {
                                     continue;
                                 }
-                                local_files_scanned += 1;
+                                dir_files_scanned += 1;
 
                                 let Ok(meta) = entry.metadata() else {
                                     continue;
@@ -608,6 +638,13 @@ pub fn scan_files(cfg: &Config) -> FileScanReport {
                                     });
                                 }
                             }
+                        }
+                    }
+
+                    if dir_files_scanned > 0 {
+                        local_files_scanned += dir_files_scanned;
+                        if let Some(p) = progress {
+                            p.add_files(dir_files_scanned);
                         }
                     }
 

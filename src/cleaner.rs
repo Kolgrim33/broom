@@ -2,6 +2,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::format::display_path;
+use crate::progress::CleanProgress;
 use crate::scanner::{Artifact, LargeFile};
 
 #[derive(Debug)]
@@ -46,13 +48,17 @@ pub fn delete_artifact(artifact: &Artifact) -> Result<u64, String> {
     Ok(artifact.size_bytes)
 }
 
-pub fn clean_artifacts(targets: &[&Artifact]) -> CleanSummary {
+pub fn clean_artifacts(targets: &[&Artifact], progress: Option<&CleanProgress>) -> CleanSummary {
     let start = Instant::now();
+    let cwd = std::env::current_dir().ok();
     let mut deleted_count = 0usize;
     let mut freed_bytes = 0u64;
     let mut failures = Vec::new();
 
     for artifact in targets {
+        if let Some(p) = progress {
+            p.set_current(display_path(&artifact.path, cwd.as_deref()));
+        }
         match delete_artifact(artifact) {
             Ok(bytes) => {
                 deleted_count += 1;
@@ -64,6 +70,9 @@ pub fn clean_artifacts(targets: &[&Artifact]) -> CleanSummary {
                     error: err,
                 });
             }
+        }
+        if let Some(p) = progress {
+            p.complete_item(artifact.size_bytes);
         }
     }
 
@@ -96,13 +105,17 @@ pub fn delete_file(file: &LargeFile) -> Result<u64, String> {
     Ok(file.size_bytes)
 }
 
-pub fn clean_files(targets: &[&LargeFile]) -> CleanSummary {
+pub fn clean_files(targets: &[&LargeFile], progress: Option<&CleanProgress>) -> CleanSummary {
     let start = Instant::now();
+    let cwd = std::env::current_dir().ok();
     let mut deleted_count = 0usize;
     let mut freed_bytes = 0u64;
     let mut failures = Vec::new();
 
     for file in targets {
+        if let Some(p) = progress {
+            p.set_current(display_path(&file.path, cwd.as_deref()));
+        }
         match delete_file(file) {
             Ok(bytes) => {
                 deleted_count += 1;
@@ -114,6 +127,9 @@ pub fn clean_files(targets: &[&LargeFile]) -> CleanSummary {
                     error: err,
                 });
             }
+        }
+        if let Some(p) = progress {
+            p.complete_item(file.size_bytes);
         }
     }
 
