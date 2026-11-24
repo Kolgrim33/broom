@@ -63,6 +63,7 @@ Reclaim tens of gigabytes of forgotten `target/`, `node_modules/`, `.venv/`, `bu
 | **Unity** | `ProjectSettings/ProjectVersion.txt` | `Library`, `Temp`, `Obj`, `Logs` |
 | **Unreal Engine** | `*.uproject` | `Intermediate`, `DerivedDataCache` |
 | **Terraform / OpenTofu** | `*.tf`, `*.tofu` | `.terraform` |
+| **Bazel** | `WORKSPACE`, `WORKSPACE.bazel`, `MODULE.bazel` | `bazel-bin`, `bazel-out` |
 
 *Missing your favorite language or build tool? Adding an ecosystem takes ~15 lines — see [CONTRIBUTING.md](CONTRIBUTING.md)!*
 
