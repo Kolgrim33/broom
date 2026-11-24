@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::scanner::Artifact;
+use crate::scanner::{Artifact, LargeFile};
 
 #[derive(Debug)]
 pub struct CleanFailure {
@@ -61,6 +61,56 @@ pub fn clean_artifacts(targets: &[&Artifact]) -> CleanSummary {
             Err(err) => {
                 failures.push(CleanFailure {
                     path: artifact.path.to_string_lossy().into_owned(),
+                    error: err,
+                });
+            }
+        }
+    }
+
+    CleanSummary {
+        deleted_count,
+        freed_bytes,
+        failures,
+        elapsed: start.elapsed(),
+    }
+}
+
+/// Validates that a file path is safe to delete (not root, not a symlink, regular file).
+fn assert_safe_file(path: &Path) -> Result<(), String> {
+    if path.parent().is_none() {
+        return Err("refusing to delete filesystem root".to_string());
+    }
+    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() {
+        return Err("refusing to delete symlink".to_string());
+    }
+    if !meta.file_type().is_file() {
+        return Err("target is not a regular file".to_string());
+    }
+    Ok(())
+}
+
+pub fn delete_file(file: &LargeFile) -> Result<u64, String> {
+    assert_safe_file(&file.path)?;
+    fs::remove_file(&file.path).map_err(|e| e.to_string())?;
+    Ok(file.size_bytes)
+}
+
+pub fn clean_files(targets: &[&LargeFile]) -> CleanSummary {
+    let start = Instant::now();
+    let mut deleted_count = 0usize;
+    let mut freed_bytes = 0u64;
+    let mut failures = Vec::new();
+
+    for file in targets {
+        match delete_file(file) {
+            Ok(bytes) => {
+                deleted_count += 1;
+                freed_bytes = freed_bytes.saturating_add(bytes);
+            }
+            Err(err) => {
+                failures.push(CleanFailure {
+                    path: file.path.to_string_lossy().into_owned(),
                     error: err,
                 });
             }

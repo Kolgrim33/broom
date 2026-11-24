@@ -1,4 +1,5 @@
-use std::collections::{HashSet, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::{Config, SortBy};
 use crate::ecosystems::{self, Ecosystem};
+
+pub const DEFAULT_FILES_LIMIT: usize = 25;
 
 #[derive(Debug, Clone)]
 pub struct Artifact {
@@ -21,6 +24,23 @@ pub struct Artifact {
 #[derive(Debug)]
 pub struct ScanReport {
     pub artifacts: Vec<Artifact>,
+    pub dirs_scanned: usize,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct LargeFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub age: Duration,
+    pub extension: String,
+}
+
+#[derive(Debug)]
+pub struct FileScanReport {
+    pub files: Vec<LargeFile>,
+    pub total_matched: usize,
+    pub files_scanned: usize,
     pub dirs_scanned: usize,
     pub elapsed: Duration,
 }
@@ -298,6 +318,25 @@ fn update_newest(slot: &mut Option<SystemTime>, candidate: SystemTime) {
     }
 }
 
+/// Computes actual disk usage of a single file (POSIX blocks on Unix, apparent length otherwise).
+fn file_disk_bytes(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // st_blocks is always in 512-byte units on POSIX/Linux/macOS
+        let blocks_bytes = meta.blocks().saturating_mul(512);
+        if blocks_bytes > 0 {
+            blocks_bytes
+        } else {
+            meta.len()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
 /// Computes actual disk usage (with hardlink deduplication on Unix) and file count
 /// without following symlinks.
 pub fn measure_dir(root: &Path) -> (u64, u64, Option<SystemTime>) {
@@ -334,21 +373,306 @@ pub fn measure_dir(root: &Path) -> (u64, u64, Option<SystemTime>) {
                     if nlink > 1 && !seen_inodes.insert((meta.dev(), meta.ino())) {
                         continue;
                     }
-                    // st_blocks is always in 512-byte units on POSIX/Linux/macOS
-                    let blocks_bytes = meta.blocks().saturating_mul(512);
-                    total_bytes = total_bytes.saturating_add(if blocks_bytes > 0 {
-                        blocks_bytes
-                    } else {
-                        meta.len()
-                    });
                 }
-                #[cfg(not(unix))]
-                {
-                    total_bytes = total_bytes.saturating_add(meta.len());
-                }
+                total_bytes = total_bytes.saturating_add(file_disk_bytes(&meta));
             }
         }
     }
 
     (total_bytes, total_files, newest_mtime)
+}
+
+struct WorstFirst(LargeFile);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.size_bytes == other.0.size_bytes && self.0.path == other.0.path
+    }
+}
+
+impl Eq for WorstFirst {}
+
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstFirst {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Max-heap root is the worst item among the top-K: smallest size, or largest path on tie.
+        other
+            .0
+            .size_bytes
+            .cmp(&self.0.size_bytes)
+            .then_with(|| self.0.path.cmp(&other.0.path))
+    }
+}
+
+fn file_extension(path: &Path) -> String {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Parallel walker that finds the largest individual files under `cfg.paths`.
+pub fn scan_files(cfg: &Config) -> FileScanReport {
+    let start = Instant::now();
+    let now = SystemTime::now();
+    let effective_limit = cfg.limit.unwrap_or(DEFAULT_FILES_LIMIT);
+    let use_top_heap = cfg.sort_by == SortBy::Size && !cfg.reverse && effective_limit > 0;
+
+    let num_threads = cfg.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 16)
+    });
+
+    let queue = Mutex::new(WorkQueue {
+        items: VecDeque::new(),
+        active_workers: 0,
+    });
+    let condvar = Condvar::new();
+    let results: Mutex<Vec<LargeFile>> = Mutex::new(Vec::new());
+    let visited: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+    let dirs_scanned = AtomicUsize::new(0);
+    let files_scanned = AtomicUsize::new(0);
+    let total_matched = AtomicUsize::new(0);
+
+    {
+        let mut q = queue.lock().unwrap();
+        let mut seen = visited.lock().unwrap();
+        let mut initial_files = Vec::new();
+        for p in &cfg.paths {
+            let resolved = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            if !seen.insert(resolved.clone()) {
+                continue;
+            }
+            if resolved.is_dir() {
+                q.items.push_back(WorkItem {
+                    dir: resolved,
+                    depth: 0,
+                });
+            } else if resolved.is_file() {
+                files_scanned.fetch_add(1, Ordering::Relaxed);
+                if !is_excluded(&resolved, &cfg.excludes)
+                    && let Ok(meta) = fs::metadata(&resolved)
+                {
+                    let size_bytes = file_disk_bytes(&meta);
+                    let age = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| now.duration_since(m).ok())
+                        .unwrap_or(Duration::ZERO);
+                    if size_bytes >= cfg.min_size
+                        && cfg.older_than.is_none_or(|min_age| age >= min_age)
+                    {
+                        total_matched.fetch_add(1, Ordering::Relaxed);
+                        let extension = file_extension(&resolved);
+                        initial_files.push(LargeFile {
+                            path: resolved,
+                            size_bytes,
+                            age,
+                            extension,
+                        });
+                    }
+                }
+            }
+        }
+        if !initial_files.is_empty() {
+            results.lock().unwrap().extend(initial_files);
+        }
+    }
+
+    std::thread::scope(|scope| {
+        for _ in 0..num_threads {
+            scope.spawn(|| {
+                let mut local_heap: BinaryHeap<WorstFirst> = if use_top_heap {
+                    BinaryHeap::with_capacity(effective_limit)
+                } else {
+                    BinaryHeap::new()
+                };
+                let mut local_vec: Vec<LargeFile> = Vec::new();
+                let mut local_files_scanned: usize = 0;
+                let mut local_matched: usize = 0;
+
+                loop {
+                    let work = {
+                        let mut q = queue.lock().unwrap();
+                        loop {
+                            if let Some(item) = q.items.pop_front() {
+                                q.active_workers += 1;
+                                break Some(item);
+                            }
+                            if q.active_workers == 0 {
+                                break None;
+                            }
+                            q = condvar.wait(q).unwrap();
+                        }
+                    };
+
+                    let Some(work) = work else {
+                        break;
+                    };
+
+                    dirs_scanned.fetch_add(1, Ordering::Relaxed);
+                    let mut next_dirs = Vec::new();
+                    let can_descend = cfg.max_depth.is_none_or(|max| work.depth < max);
+
+                    if let Ok(read_dir) = fs::read_dir(&work.dir) {
+                        for entry in read_dir.flatten() {
+                            let Ok(ft) = entry.file_type() else {
+                                continue;
+                            };
+                            if ft.is_symlink() {
+                                continue;
+                            }
+                            let name_os = entry.file_name();
+                            let name = name_os.to_string_lossy();
+                            let path = entry.path();
+
+                            if is_excluded(&path, &cfg.excludes) {
+                                continue;
+                            }
+
+                            if ft.is_dir() {
+                                if !can_descend {
+                                    continue;
+                                }
+                                if !cfg.include_hidden && name.starts_with('.') {
+                                    continue;
+                                }
+                                if matches!(name.as_ref(), ".git" | ".hg" | ".svn" | "proc" | "sys")
+                                {
+                                    continue;
+                                }
+                                next_dirs.push(path);
+                            } else if ft.is_file() {
+                                if !cfg.include_hidden && name.starts_with('.') {
+                                    continue;
+                                }
+                                local_files_scanned += 1;
+
+                                let Ok(meta) = entry.metadata() else {
+                                    continue;
+                                };
+                                let size_bytes = file_disk_bytes(&meta);
+                                if size_bytes < cfg.min_size {
+                                    continue;
+                                }
+                                let age = meta
+                                    .modified()
+                                    .ok()
+                                    .and_then(|m| now.duration_since(m).ok())
+                                    .unwrap_or(Duration::ZERO);
+                                if let Some(min_age) = cfg.older_than
+                                    && age < min_age
+                                {
+                                    continue;
+                                }
+
+                                local_matched += 1;
+
+                                if effective_limit == 0 {
+                                    continue;
+                                }
+
+                                if use_top_heap {
+                                    if local_heap.len() == effective_limit
+                                        && let Some(worst) = local_heap.peek()
+                                        && (size_bytes < worst.0.size_bytes
+                                            || (size_bytes == worst.0.size_bytes
+                                                && path >= worst.0.path))
+                                    {
+                                        continue;
+                                    }
+                                    let extension = file_extension(&path);
+                                    let item = WorstFirst(LargeFile {
+                                        path,
+                                        size_bytes,
+                                        age,
+                                        extension,
+                                    });
+                                    if local_heap.len() == effective_limit {
+                                        local_heap.pop();
+                                    }
+                                    local_heap.push(item);
+                                } else {
+                                    let extension = file_extension(&path);
+                                    local_vec.push(LargeFile {
+                                        path,
+                                        size_bytes,
+                                        age,
+                                        extension,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    {
+                        let mut q = queue.lock().unwrap();
+                        if !next_dirs.is_empty() {
+                            let mut seen = visited.lock().unwrap();
+                            for d in next_dirs {
+                                if seen.insert(d.clone()) {
+                                    q.items.push_back(WorkItem {
+                                        dir: d,
+                                        depth: work.depth + 1,
+                                    });
+                                }
+                            }
+                        }
+                        q.active_workers -= 1;
+                        if !q.items.is_empty() || q.active_workers == 0 {
+                            condvar.notify_all();
+                        }
+                    }
+                }
+
+                files_scanned.fetch_add(local_files_scanned, Ordering::Relaxed);
+                total_matched.fetch_add(local_matched, Ordering::Relaxed);
+
+                if use_top_heap {
+                    if !local_heap.is_empty() {
+                        results
+                            .lock()
+                            .unwrap()
+                            .extend(local_heap.into_iter().map(|w| w.0));
+                    }
+                } else if !local_vec.is_empty() {
+                    results.lock().unwrap().extend(local_vec);
+                }
+            });
+        }
+    });
+
+    let mut files = results.into_inner().unwrap();
+
+    files.sort_by(|a, b| {
+        let ord = match cfg.sort_by {
+            SortBy::Size => b
+                .size_bytes
+                .cmp(&a.size_bytes)
+                .then_with(|| a.path.cmp(&b.path)),
+            SortBy::Age => b
+                .age
+                .cmp(&a.age)
+                .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+                .then_with(|| a.path.cmp(&b.path)),
+            SortBy::Path => a.path.cmp(&b.path),
+        };
+        if cfg.reverse { ord.reverse() } else { ord }
+    });
+
+    files.truncate(effective_limit);
+
+    FileScanReport {
+        files,
+        total_matched: total_matched.load(Ordering::Relaxed),
+        files_scanned: files_scanned.load(Ordering::Relaxed),
+        dirs_scanned: dirs_scanned.load(Ordering::Relaxed),
+        elapsed: start.elapsed(),
+    }
 }

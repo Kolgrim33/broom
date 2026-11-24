@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::scanner::{Artifact, ScanReport};
+use crate::scanner::{Artifact, FileScanReport, LargeFile, ScanReport};
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
@@ -10,6 +10,8 @@ pub const DIM: &str = "\x1b[2m";
 pub const RED: &str = "\x1b[31m";
 pub const GREEN: &str = "\x1b[32m";
 pub const YELLOW: &str = "\x1b[33m";
+pub const BLUE: &str = "\x1b[34m";
+pub const MAGENTA: &str = "\x1b[35m";
 pub const CYAN: &str = "\x1b[36m";
 
 pub fn should_use_color(no_color_flag: bool) -> bool {
@@ -180,6 +182,177 @@ pub fn print_table(report: &ScanReport, color: bool) {
             report.dirs_scanned
         );
     }
+}
+
+pub fn ext_display(ext: &str) -> String {
+    if ext.is_empty() {
+        return "-".to_string();
+    }
+    let dotted = format!(".{ext}");
+    let char_count = dotted.chars().count();
+    if char_count <= 10 {
+        dotted
+    } else {
+        let mut s: String = dotted.chars().take(9).collect();
+        s.push('…');
+        s
+    }
+}
+
+pub fn ext_ansi_color(ext: &str) -> &'static str {
+    match ext {
+        "" => DIM,
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "deb" | "rpm"
+        | "pkg" => YELLOW,
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "wmv" | "mp3" | "wav" | "flac" | "ogg" | "png"
+        | "jpg" | "jpeg" | "webp" | "psd" | "gif" => MAGENTA,
+        "iso" | "img" | "dmg" | "qcow2" | "vmdk" | "vdi" | "vhd" | "vhdx" | "gguf"
+        | "safetensors" | "bin" | "ckpt" | "pt" | "pth" | "onnx" => RED,
+        "log" | "sql" | "sqlite" | "sqlite3" | "db" | "dump" | "bak" | "parquet" | "csv" => BLUE,
+        _ => CYAN,
+    }
+}
+
+pub fn print_files_table(report: &FileScanReport, color: bool) {
+    let cwd = std::env::current_dir().ok();
+    let max_size = report.files.iter().map(|f| f.size_bytes).max().unwrap_or(0);
+    let idx_width = report.files.len().to_string().len().max(2);
+
+    if color {
+        println!(
+            "\n  {BOLD}{DIM}{:>idx_w$}  {:<10}  {:>10}  {:<10}  {:>8}  PATH{RESET}",
+            "#",
+            "EXT",
+            "SIZE",
+            "SHARE",
+            "AGE",
+            idx_w = idx_width
+        );
+    } else {
+        println!(
+            "\n  {:>idx_w$}  {:<10}  {:>10}  {:<10}  {:>8}  PATH",
+            "#",
+            "EXT",
+            "SIZE",
+            "SHARE",
+            "AGE",
+            idx_w = idx_width
+        );
+    }
+
+    for (i, item) in report.files.iter().enumerate() {
+        let num = i + 1;
+        let ext_label = ext_display(&item.extension);
+        let size_str = format_bytes(item.size_bytes);
+        let bar = render_bar(item.size_bytes, max_size, 10);
+        let age_str = format_age(item.age);
+        let path_str = display_path(&item.path, cwd.as_deref());
+
+        if color {
+            let ext_color = ext_ansi_color(&item.extension);
+            let size_color = if item.size_bytes >= 1_073_741_824 {
+                RED
+            } else if item.size_bytes >= 104_857_600 {
+                YELLOW
+            } else {
+                CYAN
+            };
+            let age_color = if item.age.as_secs() >= 30 * 86_400 {
+                DIM
+            } else {
+                GREEN
+            };
+            println!(
+                "  {DIM}{num:>idx_w$}{RESET}  {ext_color}{ext_label:<10}{RESET}  {size_color}{BOLD}{size_str:>10}{RESET}  {size_color}{bar}{RESET}  {age_color}{age_str:>8}{RESET}  {path_str}",
+                idx_w = idx_width
+            );
+        } else {
+            println!(
+                "  {num:>idx_w$}  {ext_label:<10}  {size_str:>10}  {bar}  {age_str:>8}  {path_str}",
+                idx_w = idx_width
+            );
+        }
+    }
+
+    let total_bytes: u64 = report.files.iter().map(|f| f.size_bytes).sum();
+    let count = report.files.len();
+    let noun = if count == 1 { "file" } else { "files" };
+    let elapsed = format_duration_short(report.elapsed);
+    let shown_note = if report.total_matched > count {
+        format!(" (showing {count} of {} matched)", report.total_matched)
+    } else {
+        String::new()
+    };
+
+    println!();
+    if color {
+        println!(
+            "  {BOLD}Total:{RESET} {YELLOW}{BOLD}{}{RESET} across {BOLD}{count}{RESET} {noun}{DIM}{shown_note} (scanned {} files in {} dirs in {elapsed}){RESET}",
+            format_bytes(total_bytes),
+            report.files_scanned,
+            report.dirs_scanned
+        );
+    } else {
+        println!(
+            "  Total: {} across {count} {noun}{shown_note} (scanned {} files in {} dirs in {elapsed})",
+            format_bytes(total_bytes),
+            report.files_scanned,
+            report.dirs_scanned
+        );
+    }
+}
+
+pub fn render_files_json(report: &FileScanReport) -> String {
+    let total_bytes: u64 = report.files.iter().map(|f| f.size_bytes).sum();
+    let mut out = String::with_capacity(256 + report.files.len() * 140);
+    out.push_str("{\n");
+    out.push_str("  \"mode\": \"files\",\n");
+    out.push_str(&format!("  \"total_bytes\": {total_bytes},\n"));
+    out.push_str(&format!(
+        "  \"total_human\": \"{}\",\n",
+        json_escape(&format_bytes(total_bytes))
+    ));
+    out.push_str(&format!("  \"count\": {},\n", report.files.len()));
+    out.push_str(&format!("  \"total_matched\": {},\n", report.total_matched));
+    out.push_str(&format!("  \"files_scanned\": {},\n", report.files_scanned));
+    out.push_str(&format!("  \"dirs_scanned\": {},\n", report.dirs_scanned));
+    out.push_str(&format!(
+        "  \"elapsed_ms\": {},\n",
+        report.elapsed.as_millis()
+    ));
+    out.push_str("  \"files\": [\n");
+    for (i, f) in report.files.iter().enumerate() {
+        push_file_json(&mut out, f);
+        if i + 1 < report.files.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("  ]\n}\n");
+    out
+}
+
+fn push_file_json(out: &mut String, f: &LargeFile) {
+    out.push_str("    {\n");
+    out.push_str(&format!(
+        "      \"path\": \"{}\",\n",
+        json_escape(&f.path.to_string_lossy())
+    ));
+    out.push_str(&format!(
+        "      \"extension\": \"{}\",\n",
+        json_escape(&f.extension)
+    ));
+    out.push_str(&format!("      \"size_bytes\": {},\n", f.size_bytes));
+    out.push_str(&format!(
+        "      \"size_human\": \"{}\",\n",
+        json_escape(&format_bytes(f.size_bytes))
+    ));
+    out.push_str(&format!("      \"age_secs\": {},\n", f.age.as_secs()));
+    out.push_str(&format!(
+        "      \"age_human\": \"{}\"\n",
+        json_escape(&format_age(f.age))
+    ));
+    out.push_str("    }");
 }
 
 pub fn render_json(report: &ScanReport) -> String {

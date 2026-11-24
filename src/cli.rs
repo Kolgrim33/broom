@@ -13,6 +13,7 @@ pub enum SortBy {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub paths: Vec<PathBuf>,
+    pub files: bool,
     pub dry_run: bool,
     pub yes: bool,
     pub interactive: bool,
@@ -34,6 +35,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             paths: Vec::new(),
+            files: false,
             dry_run: false,
             yes: false,
             interactive: false,
@@ -87,6 +89,7 @@ where
                     let val = take_value(flag, inline_val, &mut iter)?;
                     return Ok(ParseOutcome::PrintCompletions(completion_script(&val)?));
                 }
+                "--files" => cfg.files = true,
                 "--dry-run" => cfg.dry_run = true,
                 "--yes" => cfg.yes = true,
                 "--interactive" => cfg.interactive = true,
@@ -147,6 +150,7 @@ where
             match arg.as_str() {
                 "-h" => return Ok(ParseOutcome::PrintHelp),
                 "-V" => return Ok(ParseOutcome::PrintVersion),
+                "-f" => cfg.files = true,
                 "-n" => cfg.dry_run = true,
                 "-y" => cfg.yes = true,
                 "-i" => cfg.interactive = true,
@@ -198,6 +202,10 @@ where
 
     if cfg.dry_run && cfg.yes {
         return Err("cannot combine --dry-run and --yes".to_string());
+    }
+
+    if cfg.files && !cfg.ecosystems.is_empty() {
+        return Err("cannot combine --files and --type".to_string());
     }
 
     Ok(ParseOutcome::Run(cfg))
@@ -334,18 +342,19 @@ ARGS:
     [PATH...]                 Directories to scan (defaults to current directory)
 
 OPTIONS:
+    -f, --files               Scan for the largest individual files instead of build artifacts
     -n, --dry-run             Scan and print report only; do not prompt or delete
-    -y, --yes                 Delete all matched artifacts without prompting
-    -i, --interactive         Prompt individually for each artifact
-    -a, --older-than <AGE>    Only match projects untouched for at least AGE (e.g. 7d, 2w, 3mo, 1y)
-    -s, --min-size <SIZE>     Only match artifacts at least SIZE (e.g. 50M, 1GiB)
-    -t, --type <LIST>         Filter by ecosystem (comma-separated, repeatable)
+    -y, --yes                 Delete all matched artifacts/files without prompting
+    -i, --interactive         Prompt individually for each item
+    -a, --older-than <AGE>    Only match projects/files untouched for at least AGE (e.g. 7d, 2w, 3mo, 1y)
+    -s, --min-size <SIZE>     Only match items at least SIZE (e.g. 50M, 1GiB)
+    -t, --type <LIST>         Filter by ecosystem (comma-separated, repeatable; artifact mode only)
     -e, --exclude <PATTERN>   Exclude paths containing PATTERN (repeatable)
     -d, --max-depth <N>       Maximum directory depth to scan
         --sort <FIELD>        Sort by: size (default), age, or path
     -r, --reverse             Reverse sort order
-        --limit <N>           Show/operate on at most N results
-        --hidden              Descend into hidden directories (other than artifact dirs)
+        --limit <N>           Show/operate on at most N results (default: 25 in --files mode)
+        --hidden              Descend into hidden directories (and include hidden files in --files mode)
         --json                Output results as JSON (implies --dry-run)
         --no-color            Disable colored output
     -j, --threads <N>         Number of worker threads (default: CPU count)
@@ -361,6 +370,8 @@ EXAMPLES:
     broom -n ~/Projects                   Preview reclaimable space without deleting
     broom -a 30d -s 100M ~/Projects       Find artifacts >100MB untouched for 30+ days
     broom -t rust,node -y ~/Projects      Clean all Rust & Node artifacts immediately
+    broom -f ~/Downloads                  Find the 25 largest files and interactively sweep
+    broom -f -n -s 100M --limit 10 ~      Preview the 10 largest files over 100MB
     broom --json ~/Projects               Machine-readable report for scripts
 ",
         version = env!("CARGO_PKG_VERSION"),
@@ -374,6 +385,7 @@ const SORT_VALUES: &[&str] = &["size", "age", "path"];
 
 /// Long options and their descriptions, kept in sync with `parse_args`.
 const LONG_OPTIONS: &[(&str, &str)] = &[
+    ("--files", "Scan for the largest individual files"),
     ("--dry-run", "Scan and print report only, do not delete"),
     ("--yes", "Delete all matched artifacts without prompting"),
     ("--interactive", "Prompt individually for each artifact"),
@@ -398,6 +410,7 @@ const LONG_OPTIONS: &[(&str, &str)] = &[
 ];
 
 const SHORT_OPTIONS: &[(&str, &str)] = &[
+    ("-f", "Scan for the largest individual files"),
     ("-n", "Scan and print report only"),
     ("-y", "Delete all matched artifacts without prompting"),
     ("-i", "Prompt individually for each artifact"),
@@ -413,6 +426,7 @@ const SHORT_OPTIONS: &[(&str, &str)] = &[
 ];
 
 const SHORT_TO_LONG: &[(&str, &str)] = &[
+    ("-f", "--files"),
     ("-n", "--dry-run"),
     ("-y", "--yes"),
     ("-i", "--interactive"),
@@ -703,5 +717,23 @@ mod tests {
         assert!(script.contains("compdef"));
         assert!(parse_args(["broom", "--completions=fish"].map(String::from)).is_ok());
         assert!(parse_args(["broom", "--completions", "tcsh"].map(String::from)).is_err());
+    }
+
+    #[test]
+    fn parses_files_flag_and_rejects_type_combo() {
+        let args = ["broom", "-f", "-n", "--limit", "10", "/tmp"]
+            .into_iter()
+            .map(String::from);
+        let ParseOutcome::Run(cfg) = parse_args(args).unwrap() else {
+            panic!("expected Run");
+        };
+        assert!(cfg.files);
+        assert!(cfg.dry_run);
+        assert_eq!(cfg.limit, Some(10));
+
+        let bad = ["broom", "--files", "-t", "rust"]
+            .into_iter()
+            .map(String::from);
+        assert!(parse_args(bad).is_err());
     }
 }
