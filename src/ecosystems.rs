@@ -27,6 +27,7 @@ pub enum Ecosystem {
     Unity,
     Unreal,
     Terraform,
+    Bazel,
 }
 
 impl Ecosystem {
@@ -56,6 +57,7 @@ impl Ecosystem {
         Ecosystem::Unity,
         Ecosystem::Unreal,
         Ecosystem::Terraform,
+        Ecosystem::Bazel,
     ];
 
     pub fn name(self) -> &'static str {
@@ -85,6 +87,7 @@ impl Ecosystem {
             Ecosystem::Unity => "Unity",
             Ecosystem::Unreal => "Unreal",
             Ecosystem::Terraform => "Terraform",
+            Ecosystem::Bazel => "Bazel",
         }
     }
 
@@ -115,6 +118,7 @@ impl Ecosystem {
             Ecosystem::Unity => "unity",
             Ecosystem::Unreal => "unreal",
             Ecosystem::Terraform => "terraform",
+            Ecosystem::Bazel => "bazel",
         }
     }
 
@@ -145,6 +149,7 @@ impl Ecosystem {
             "unity" | "unity3d" => Some(Ecosystem::Unity),
             "unreal" | "ue" | "ue4" | "ue5" => Some(Ecosystem::Unreal),
             "terraform" | "tf" | "tofu" | "opentofu" => Some(Ecosystem::Terraform),
+            "bazel" | "bzl" => Some(Ecosystem::Bazel),
             _ => None,
         }
     }
@@ -177,6 +182,7 @@ impl Ecosystem {
             Ecosystem::Unity => "\x1b[38;5;250m",     // silver
             Ecosystem::Unreal => "\x1b[38;5;63m",     // royal blue
             Ecosystem::Terraform => "\x1b[38;5;135m", // orchid
+            Ecosystem::Bazel => "\x1b[38;5;40m",      // green
         }
     }
 }
@@ -674,6 +680,19 @@ pub const RULES: &[ArtifactRule] = &[
         ecosystem: Ecosystem::Terraform,
         dir_name: ".terraform",
         parent_markers: &[".tf", ".tofu"],
+        inner_marker: None,
+    },
+    // Bazel output trees are named specifically, so no inner marker is needed.
+    ArtifactRule {
+        ecosystem: Ecosystem::Bazel,
+        dir_name: "bazel-bin",
+        parent_markers: &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"],
+        inner_marker: None,
+    },
+    ArtifactRule {
+        ecosystem: Ecosystem::Bazel,
+        dir_name: "bazel-out",
+        parent_markers: &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"],
         inner_marker: None,
     },
 ];
